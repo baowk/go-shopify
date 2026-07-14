@@ -9,7 +9,7 @@ The new home of Conversio's Shopify Go library.
 
 ## Supported Go Versions
 
-This library is tested automatically against the latest version of Go (currently 1.22) and the two previous versions (1.21, 1.20) but should also work with older versions.
+This library is tested automatically against the Go versions listed in the GitHub Actions workflow.
 
 ## Install v4
 
@@ -111,8 +111,41 @@ app := goshopify.App{
 client, err := goshopify.NewClient(app, "shopname", "token")
 
 // Fetch the number of products.
-numProducts, err := client.Product.Count(nil)
+numProducts, err := client.Product.Count(context.Background(), nil)
 ```
+
+#### GraphQL Admin API for new integrations
+
+Shopify classifies the REST Admin API as legacy. Build new integrations with the GraphQL Admin API and always select an explicit quarterly API version. Update the version during the application's regular Shopify upgrade cycle.
+
+```go
+client, err := goshopify.NewClient(
+    app,
+    "shopname",
+    "token",
+    goshopify.WithVersion("2026-07"),
+    goshopify.WithRetry(3),
+)
+if err != nil {
+    return err
+}
+
+query := `query ShopIdentity { shop { id name } }`
+var result struct {
+    Shop struct {
+        ID   string `json:"id"`
+        Name string `json:"name"`
+    } `json:"shop"`
+}
+if err := client.GraphQL.Query(ctx, query, nil, &result); err != nil {
+    return err
+}
+
+// Safe to read while other requests are using the same shop client.
+limits := client.LastRateLimits()
+```
+
+Retry waits honor the request context, so cancellation and deadlines stop both REST and GraphQL throttling waits promptly. A client is scoped to one shop and can be shared by concurrent requests; use `LastRateLimits` instead of reading `RateLimits` directly while requests are in flight.
 
 #### Private App Auth
 
@@ -145,7 +178,7 @@ to understand the format and release schedules. You can use `WithVersion` to spe
 of the API. If you do not use this option you will be defaulted to the oldest stable API.
 
 ```go
-client, err := goshopify.NewClient(app, "shopname", "", goshopify.WithVersion("2019-04"))
+client, err := goshopify.NewClient(app, "shopname", "", goshopify.WithVersion("2026-07"))
 ```
 
 #### WithRetry

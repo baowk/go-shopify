@@ -2,10 +2,12 @@ package goshopify
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/jarcoal/httpmock"
 )
@@ -294,6 +296,33 @@ func TestGraphQLQueryWithThrottledError(t *testing.T) {
 
 	if client.RateLimits.RetryAfterSeconds != expectedRetryAfterSeconds {
 		t.Errorf("GraphQL.Query client.RateLimits.RetryAfterSeconds is %f but expected %f", client.RateLimits.RetryAfterSeconds, expectedRetryAfterSeconds)
+	}
+}
+
+func TestGraphQLQueryHonorsContextCancellationDuringThrottle(t *testing.T) {
+	setup()
+	defer teardown()
+
+	httpmock.RegisterResponder(
+		http.MethodPost,
+		fmt.Sprintf("https://fooshop.myshopify.com/%s/graphql.json", client.pathPrefix),
+		httpmock.NewStringResponder(http.StatusOK, `{
+			"errors":[{"message":"Throttled","extensions":{"code":"THROTTLED"}}],
+			"extensions":{"cost":{"requestedQueryCost":400,"throttleStatus":{
+				"maximumAvailable":1000.0,"currentlyAvailable":300,"restoreRate":50.0
+			}}}
+		}`),
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	err := client.GraphQL.Query(ctx, "query {}", nil, &struct{}{})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("GraphQL.Query() error = %v, expected context deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > 250*time.Millisecond {
+		t.Fatalf("GraphQL.Query() returned after %s; retry wait ignored context", elapsed)
 	}
 }
 

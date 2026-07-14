@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/go-querystring/query"
@@ -80,7 +81,10 @@ type Client struct {
 	// max number of retries, defaults to 0 for no retries see WithRetry option
 	retries  int
 	attempts int
+	stateMu  sync.RWMutex
 
+	// RateLimits contains the most recently observed limits. Concurrent callers
+	// should use LastRateLimits to read a consistent snapshot.
 	RateLimits RateLimitInfo
 
 	// Services used for communicating with the API
@@ -362,7 +366,12 @@ func (c *Client) doGetHeaders(req *http.Request, v interface{}) (http.Header, er
 	var resp *http.Response
 	var err error
 	retries := c.retries
-	c.attempts = 0
+	attempts := 0
+	defer func() {
+		c.stateMu.Lock()
+		c.attempts = attempts
+		c.stateMu.Unlock()
+	}()
 	c.logRequest(req)
 
 	// copy request body so it can be re-used
@@ -376,7 +385,7 @@ func (c *Client) doGetHeaders(req *http.Request, v interface{}) (http.Header, er
 	}
 
 	for {
-		c.attempts++
+		attempts++
 		req.Body = ioutil.NopCloser(bytes.NewBuffer(body))
 		resp, err = c.Client.Do(req)
 		c.logResponse(resp)
@@ -401,7 +410,9 @@ func (c *Client) doGetHeaders(req *http.Request, v interface{}) (http.Header, er
 
 			wait := time.Duration(rateLimitErr.RetryAfter) * time.Second
 			c.log.Debugf("rate limited waiting %s", wait.String())
-			time.Sleep(wait)
+			if err := waitForRetry(req.Context(), wait); err != nil {
+				return nil, err
+			}
 			retries--
 			continue
 		}
@@ -424,10 +435,9 @@ func (c *Client) doGetHeaders(req *http.Request, v interface{}) (http.Header, er
 
 	defer resp.Body.Close()
 
-	if c.apiVersion == defaultApiVersion && resp.Header.Get("X-Shopify-API-Version") != "" {
+	if c.recordAPIVersion(resp.Header.Get("X-Shopify-API-Version")) {
 		// if using stable on first request set the api version
-		c.apiVersion = resp.Header.Get("X-Shopify-API-Version")
-		c.log.Infof("api version not set, now using %s", c.apiVersion)
+		c.log.Infof("api version not set, now using %s", resp.Header.Get("X-Shopify-API-Version"))
 	}
 
 	if v != nil {
@@ -438,14 +448,69 @@ func (c *Client) doGetHeaders(req *http.Request, v interface{}) (http.Header, er
 		}
 	}
 
-	if s := strings.Split(resp.Header.Get("X-Shopify-Shop-Api-Call-Limit"), "/"); len(s) == 2 {
-		c.RateLimits.RequestCount, _ = strconv.Atoi(s[0])
-		c.RateLimits.BucketSize, _ = strconv.Atoi(s[1])
+	requestCount, bucketSize := 0, 0
+	if values := strings.Split(resp.Header.Get("X-Shopify-Shop-Api-Call-Limit"), "/"); len(values) == 2 {
+		requestCount, _ = strconv.Atoi(values[0])
+		bucketSize, _ = strconv.Atoi(values[1])
 	}
-
-	c.RateLimits.RetryAfterSeconds, _ = strconv.ParseFloat(resp.Header.Get("Retry-After"), 64)
+	retryAfter, _ := strconv.ParseFloat(resp.Header.Get("Retry-After"), 64)
+	c.recordRESTRateLimits(requestCount, bucketSize, retryAfter)
 
 	return resp.Header, nil
+}
+
+// LastRateLimits returns a concurrency-safe snapshot of the most recently
+// observed REST or GraphQL rate-limit information.
+func (c *Client) LastRateLimits() RateLimitInfo {
+	c.stateMu.RLock()
+	defer c.stateMu.RUnlock()
+
+	limits := c.RateLimits
+	if limits.GraphQLCost != nil {
+		cost := *limits.GraphQLCost
+		limits.GraphQLCost = &cost
+	}
+	return limits
+}
+
+func (c *Client) recordAPIVersion(version string) bool {
+	if version == "" {
+		return false
+	}
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	if c.apiVersion != defaultApiVersion {
+		return false
+	}
+	c.apiVersion = version
+	return true
+}
+
+func (c *Client) recordRESTRateLimits(requestCount, bucketSize int, retryAfter float64) {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	c.RateLimits.RequestCount = requestCount
+	c.RateLimits.BucketSize = bucketSize
+	c.RateLimits.RetryAfterSeconds = retryAfter
+}
+
+func (c *Client) recordGraphQLRateLimits(cost GraphQLCost, retryAfter float64) {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	c.RateLimits.GraphQLCost = &cost
+	c.RateLimits.RetryAfterSeconds = retryAfter
+}
+
+func waitForRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (c *Client) logRequest(req *http.Request) {

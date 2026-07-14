@@ -90,8 +90,7 @@ func (s *GraphQLServiceOp) Query(ctx context.Context, q string, vars, resp inter
 
 		if gr.Extensions != nil {
 			retryAfterSecs = gr.Extensions.Cost.RetryAfterSeconds()
-			s.client.RateLimits.GraphQLCost = &gr.Extensions.Cost
-			s.client.RateLimits.RetryAfterSeconds = retryAfterSecs
+			s.client.recordGraphQLRateLimits(gr.Extensions.Cost, retryAfterSecs)
 		}
 
 		if len(gr.Errors) > 0 {
@@ -120,7 +119,9 @@ func (s *GraphQLServiceOp) Query(ctx context.Context, q string, vars, resp inter
 			if doRetry {
 				wait := time.Duration(math.Ceil(retryAfterSecs)) * time.Second
 				s.client.log.Debugf("rate limited waiting %s", wait.String())
-				time.Sleep(wait)
+				if err := waitForRetry(ctx, wait); err != nil {
+					return err
+				}
 				continue
 			}
 

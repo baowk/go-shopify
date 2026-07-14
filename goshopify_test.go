@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -480,6 +481,74 @@ func TestRetry(t *testing.T) {
 		} else if err == nil && !reflect.DeepEqual(body, c.expected) {
 			t.Errorf("Do(): expected %#v, actual %#v", c.expected, body)
 		}
+	}
+}
+
+func TestRetryHonorsContextCancellation(t *testing.T) {
+	setup()
+	defer teardown()
+
+	httpmock.RegisterResponder("GET", "https://fooshop.myshopify.com/retry-context",
+		func(req *http.Request) (*http.Response, error) {
+			resp := httpmock.NewStringResponse(http.StatusTooManyRequests, `{"errors":"throttled"}`)
+			resp.Header.Set("Retry-After", "1")
+			return resp, nil
+		},
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	req, err := client.NewRequest(ctx, http.MethodGet, "retry-context", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	started := time.Now()
+	err = client.Do(req, nil)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Do() error = %v, expected context deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > 250*time.Millisecond {
+		t.Fatalf("Do() returned after %s; retry wait ignored request context", elapsed)
+	}
+}
+
+func TestClientConcurrentRateLimitUpdates(t *testing.T) {
+	setup()
+	defer teardown()
+
+	httpmock.RegisterResponder(http.MethodGet,
+		fmt.Sprintf("https://fooshop.myshopify.com/%s/concurrent", client.pathPrefix),
+		func(req *http.Request) (*http.Response, error) {
+			resp := httpmock.NewStringResponse(http.StatusOK, `{"ok":true}`)
+			resp.Header.Set("X-Shopify-Shop-Api-Call-Limit", "3/40")
+			return resp, nil
+		},
+	)
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 32)
+	for i := 0; i < cap(errs); i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var result struct {
+				OK bool `json:"ok"`
+			}
+			errs <- client.Get(context.Background(), "concurrent", &result, nil)
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	limits := client.LastRateLimits()
+	if limits.RequestCount != 3 || limits.BucketSize != 40 {
+		t.Fatalf("LastRateLimits() = %#v, expected request count 3 and bucket size 40", limits)
 	}
 }
 
